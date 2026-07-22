@@ -25,49 +25,73 @@ app = Flask(__name__)
 # ==========================================
 # ⚠️ Las credenciales se leen de variables de entorno. Configúralas antes de correr el script.
 API_VERSION = "v25.0"
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-META_TOKEN = os.environ["META_TOKEN"]
-PHONE_NUMBER_ID = os.environ["PHONE_NUMBER_ID"]
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+META_TOKEN = os.environ.get("META_TOKEN")
+PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "vibecode")
-NUMERO_ASESOR = os.environ["NUMERO_ASESOR"]
+NUMERO_ASESOR = os.environ.get("NUMERO_ASESOR")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Validar que las variables de entorno estén configuradas
+if not all([OPENAI_API_KEY, META_TOKEN, PHONE_NUMBER_ID, NUMERO_ASESOR]):
+    print("⚠️ ADVERTENCIA: Faltan variables de entorno requeridas. Configúralas en Render.", flush=True)
+
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 # ==========================================
-# 🧠 HISTORIAL DE CONVERSACIÓN (SQLite, ventana deslizante)
+# 📁 CONFIGURACIÓN DE BASE DE DATOS Y ARCHIVOS (Compatible con Render)
 # ==========================================
+# Para Render: usar volumen persistente o variables de entorno
+RENDER_DISK_PATH = os.environ.get("RENDER_DISK_PATH", "/var/data")  # Render ofrece volúmenes persistentes
+DATA_DIR = os.environ.get("DATA_DIR", RENDER_DISK_PATH)
+
+# Crear directorio si no existe
+os.makedirs(DATA_DIR, exist_ok=True)
+
 # Ventana: cuántos mensajes pasados (usuario + bot) se mandan como contexto por llamada.
 VENTANA_HISTORIAL = int(os.environ.get("VENTANA_HISTORIAL", "10"))
 # Cuántos mensajes por número se conservan en disco (limpieza; no afecta lo que se manda a OpenAI).
 MAX_GUARDADOS_POR_NUMERO = 30
 
-DB_PATH = os.environ.get("HISTORIAL_DB_PATH", "historial_cess.db")
+DB_PATH = os.path.join(DATA_DIR, "historial_cess.db")
+DATOS_FILE_PATH = os.path.join(DATA_DIR, "datosCESS.txt")
+
+print(f"📁 Usando directorio de datos: {DATA_DIR}", flush=True)
+print(f"🗄️ Base de datos SQLite: {DB_PATH}", flush=True)
 
 
 def inicializar_db():
-    con = sqlite3.connect(DB_PATH)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS historial (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            numero TEXT NOT NULL,
-            rol TEXT NOT NULL,
-            contenido TEXT NOT NULL,
-            creado_en TEXT NOT NULL
-        )
-    """)
-    con.execute("CREATE INDEX IF NOT EXISTS idx_historial_numero ON historial(numero)")
-    con.commit()
-    con.close()
+    """Inicializa la base de datos SQLite con tabla de historial."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS historial (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                numero TEXT NOT NULL,
+                rol TEXT NOT NULL,
+                contenido TEXT NOT NULL,
+                creado_en TEXT NOT NULL
+            )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_historial_numero ON historial(numero)")
+        con.commit()
+        con.close()
+        print(f"✅ Base de datos inicializada en {DB_PATH}", flush=True)
+    except Exception as e:
+        print(f"❌ Error inicializando la base de datos: {e}", flush=True)
 
 
 def guardar_mensaje(numero: str, rol: str, contenido: str):
-    con = sqlite3.connect(DB_PATH)
-    con.execute(
-        "INSERT INTO historial (numero, rol, contenido, creado_en) VALUES (?, ?, ?, ?)",
-        (numero, rol, contenido, datetime.now(timezone.utc).isoformat()),
-    )
-    con.commit()
-    con.close()
+    """Guarda un mensaje en la base de datos."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            "INSERT INTO historial (numero, rol, contenido, creado_en) VALUES (?, ?, ?, ?)",
+            (numero, rol, contenido, datetime.now(timezone.utc).isoformat()),
+        )
+        con.commit()
+        con.close()
+    except Exception as e:
+        print(f"❌ Error guardando mensaje: {e}", flush=True)
 
 
 def obtener_historial(numero: str, limite: int = None):
@@ -75,42 +99,62 @@ def obtener_historial(numero: str, limite: int = None):
     listos para pasarse como `input` a la Responses API."""
     if limite is None:
         limite = VENTANA_HISTORIAL
-    con = sqlite3.connect(DB_PATH)
-    filas = con.execute(
-        "SELECT rol, contenido FROM historial WHERE numero = ? ORDER BY id DESC LIMIT ?",
-        (numero, limite),
-    ).fetchall()
-    con.close()
-    filas.reverse()  # de más viejo a más nuevo
-    return [{"role": rol, "content": contenido} for rol, contenido in filas]
+    try:
+        con = sqlite3.connect(DB_PATH)
+        filas = con.execute(
+            "SELECT rol, contenido FROM historial WHERE numero = ? ORDER BY id DESC LIMIT ?",
+            (numero, limite),
+        ).fetchall()
+        con.close()
+        filas.reverse()  # de más viejo a más nuevo
+        return [{"role": rol, "content": contenido} for rol, contenido in filas]
+    except Exception as e:
+        print(f"❌ Error obteniendo historial: {e}", flush=True)
+        return []
 
 
 def limpiar_historial_antiguo(numero: str):
     """Evita que la tabla crezca sin límite: conserva solo los últimos
     MAX_GUARDADOS_POR_NUMERO registros de ese número."""
-    con = sqlite3.connect(DB_PATH)
-    con.execute(
-        """
-        DELETE FROM historial
-        WHERE numero = ? AND id NOT IN (
-            SELECT id FROM historial WHERE numero = ? ORDER BY id DESC LIMIT ?
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            """
+            DELETE FROM historial
+            WHERE numero = ? AND id NOT IN (
+                SELECT id FROM historial WHERE numero = ? ORDER BY id DESC LIMIT ?
+            )
+            """,
+            (numero, numero, MAX_GUARDADOS_POR_NUMERO),
         )
-        """,
-        (numero, numero, MAX_GUARDADOS_POR_NUMERO),
-    )
-    con.commit()
-    con.close()
+        con.commit()
+        con.close()
+    except Exception as e:
+        print(f"❌ Error limpiando historial: {e}", flush=True)
 
 
+# Inicializar base de datos al arrancar
 inicializar_db()
 
-# Cargar el archivo de datos una sola vez al arrancar
+# ==========================================
+# 📋 CARGAR CONTEXTO PRIVADO
+# ==========================================
+contexto_privado = ""
 try:
-    with open("datosCESS.txt", "r", encoding="utf-8") as f:
-        contexto_privado = f.read()
-except FileNotFoundError:
-    contexto_privado = ""
-    print("⚠️ Archivo datosCESS.txt no encontrado. Las respuestas de la IA podrían fallar.")
+    # Intentar leer del archivo en el directorio de datos
+    if os.path.exists(DATOS_FILE_PATH):
+        with open(DATOS_FILE_PATH, "r", encoding="utf-8") as f:
+            contexto_privado = f.read()
+        print(f"✅ Contexto cargado desde {DATOS_FILE_PATH}", flush=True)
+    else:
+        # Si no existe, intentar leer de una variable de entorno (alternativa para Render)
+        contexto_privado = os.environ.get("CONTEXTO_DATOS_CESS", "")
+        if contexto_privado:
+            print("✅ Contexto cargado desde variable de entorno CONTEXTO_DATOS_CESS", flush=True)
+        else:
+            print("⚠️ No se encontró archivo datosCESS.txt ni variable CONTEXTO_DATOS_CESS. Las respuestas de la IA podrían fallar.", flush=True)
+except Exception as e:
+    print(f"⚠️ Error cargando contexto: {e}", flush=True)
 
 # ==========================================
 # 🔧 DEFINICIÓN DE LA FUNCIÓN DE TRASPASO (Responses API)
@@ -146,7 +190,7 @@ tools_traspaso = [
 ]
 
 MENSAJES_RESPALDO = {
-    "listo_para_inscribir": "¡Perfecto! Para continuar con tu inscripción, comunícate al número 6144150015 con el mensaje \"estoy listo para la inscripcion\" o haz clic en el siguiente enlace: https://wa.me/526144150015?text=estoy%20listo%20para%20la%20inscripcion 🙂",
+    "listo_para_inscribir": "¡Perfecto! Para continuar con tu inscripción, comunícate al número 6144150015 con el mensaje \"estoy listo para la inscripcion\" o haz clic en el siguiente enlace: https://wa.me/526144150015?text=estoy%20listo%20para%20la%20inscripcion",
     "duda_sin_resolver": "En un momento te atiende un asesor para resolver tu duda 🙂",
     "tramite_administrativo": "En un momento te atiende un asesor para ayudarte con ese trámite 🙂",
 }
@@ -155,24 +199,35 @@ MENSAJE_RESPALDO_GENERICO = "En un momento te atiende un asesor 🙂"
 
 @app.route('/', methods=['GET'])
 def inicio():
-    return "¡Servidor de WhatsApp e IA activo correctamente!", 200
+    return "¡Servidor de WhatsApp e IA activo correctamente! 🚀", 200
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check para Render."""
+    return jsonify({"status": "healthy"}), 200
 
 
 @app.route('/webhook', methods=['GET'])
 def verificar_webhook():
+    """Verifica el webhook con Meta (WhatsApp)."""
     mode = request.args.get('hub.mode')
     token = request.args.get('hub.verify_token')
     challenge = request.args.get('hub.challenge')
 
     if mode and token:
         if mode == 'subscribe' and token == VERIFY_TOKEN:
+            print(f"✅ Webhook verificado exitosamente", flush=True)
             return challenge, 200
+        print(f"❌ Validación de webhook fallida. Token recibido: {token}", flush=True)
         return 'Validación fallida', 403
+    print(f"❌ Webhook verificación con formato incorrecto", flush=True)
     return 'Mal formato', 400
 
 
 @app.route('/webhook', methods=['POST'])
 def recibir_mensaje():
+    """Recibe y procesa mensajes de WhatsApp."""
     data = request.get_json()
 
     try:
@@ -235,6 +290,11 @@ def recibir_mensaje():
                         historial_previo = obtener_historial(numero_usuario)
                         entrada_modelo = historial_previo + [{"role": "user", "content": texto_usuario}]
 
+                        if not client:
+                            print(f"❌ Cliente OpenAI no disponible. OPENAI_API_KEY no configurada.", flush=True)
+                            enviar_whatsapp(numero_usuario, MENSAJE_RESPALDO_GENERICO, phone_number_id)
+                            continue
+
                         response = client.responses.create(
                             model="gpt-4o-mini",
                             instructions=instrucciones_sistema,
@@ -269,7 +329,6 @@ def recibir_mensaje():
                                     f"Nota: {datos.get('resumen', 'Sin detalle')}"
                                 )
                                 enviar_whatsapp(NUMERO_ASESOR, aviso, phone_number_id)
-                               
 
                         if not respuesta_final:
                             respuesta_final = MENSAJES_RESPALDO.get(
@@ -295,13 +354,21 @@ def recibir_mensaje():
 
     except Exception as e:
         print(f"❌ Error interno procesando el flujo de Meta: {e}", flush=True)
+        import traceback
+        traceback.print_exc()
 
     return jsonify({"status": "success"}), 200
 
 
 def enviar_whatsapp(number, text, phone_number_id=None):
+    """Envía un mensaje de texto por WhatsApp."""
     if not phone_number_id:
         phone_number_id = PHONE_NUMBER_ID
+    
+    if not all([META_TOKEN, phone_number_id]):
+        print(f"❌ Error: META_TOKEN o PHONE_NUMBER_ID no configurados", flush=True)
+        return
+    
     url = f"https://graph.facebook.com/{API_VERSION}/{phone_number_id}/messages"
     headers = {
         "Authorization": f"Bearer {META_TOKEN}",
@@ -313,11 +380,20 @@ def enviar_whatsapp(number, text, phone_number_id=None):
         "type": "text",
         "text": {"body": text}
     }
-    res = requests.post(url, json=payload, headers=headers)
-    
+    try:
+        res = requests.post(url, json=payload, headers=headers)
+        if res.status_code != 200:
+            print(f"⚠️ Error enviando mensaje a {number}: {res.status_code} - {res.text}", flush=True)
+        else:
+            print(f"✅ Mensaje enviado a {number}", flush=True)
+    except Exception as e:
+        print(f"❌ Error en enviar_whatsapp: {e}", flush=True)
 
 
 if __name__ == '__main__':
+    # Render asigna dinámicamente el puerto mediante la variable PORT
+    port = int(os.environ.get("PORT", 5000))
+    print(f"🚀 Iniciando servidor en puerto {port}", flush=True)
+    
     from waitress import serve
-    print("¡Servidor de producción Waitress encendido en el puerto 5000!")
-    serve(app, host='0.0.0.0', port=5000)
+    serve(app, host='0.0.0.0', port=port)
