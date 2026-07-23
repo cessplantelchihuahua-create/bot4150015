@@ -26,14 +26,26 @@ app = Flask(__name__)
 # ⚠️ Las credenciales se leen de variables de entorno. Configúralas antes de correr el script.
 API_VERSION = "v25.0"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+CHAT_PLATFORM = os.environ.get("CHAT_PLATFORM", "meta")  # "meta" o "sleekflow"
+
+# Configuración para Meta (WhatsApp)
 META_TOKEN = os.environ.get("META_TOKEN")
 PHONE_NUMBER_ID = os.environ.get("PHONE_NUMBER_ID")
 VERIFY_TOKEN = os.environ.get("VERIFY_TOKEN", "vibecode")
+
+# Configuración para SleekFlow
+SLEEKFLOW_API_KEY = os.environ.get("SLEEKFLOW_API_KEY")
+SLEEKFLOW_URL = os.environ.get("SLEEKFLOW_URL", "https://sleekflow.io")
+
 NUMERO_ASESOR = os.environ.get("NUMERO_ASESOR")
 
 # Validar que las variables de entorno estén configuradas
-if not all([OPENAI_API_KEY, META_TOKEN, PHONE_NUMBER_ID, NUMERO_ASESOR]):
-    print("⚠️ ADVERTENCIA: Faltan variables de entorno requeridas. Configúralas en Render.", flush=True)
+if CHAT_PLATFORM == "meta":
+    if not all([OPENAI_API_KEY, META_TOKEN, PHONE_NUMBER_ID, NUMERO_ASESOR]):
+        print("⚠️ ADVERTENCIA: Faltan variables de entorno requeridas para Meta. Configúralas en Render.", flush=True)
+elif CHAT_PLATFORM == "sleekflow":
+    if not all([OPENAI_API_KEY, SLEEKFLOW_API_KEY, NUMERO_ASESOR]):
+        print("⚠️ ADVERTENCIA: Faltan variables de entorno requeridas para SleekFlow. Configúralas en Render.", flush=True)
 
 client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
@@ -57,6 +69,7 @@ DATOS_FILE_PATH = os.path.join(DATA_DIR, "datosCESS.txt")
 
 print(f"📁 Usando directorio de datos: {DATA_DIR}", flush=True)
 print(f"🗄️ Base de datos SQLite: {DB_PATH}", flush=True)
+print(f"📡 Plataforma de chat: {CHAT_PLATFORM.upper()}", flush=True)
 
 
 def inicializar_db():
@@ -199,7 +212,7 @@ MENSAJE_RESPALDO_GENERICO = "En un momento te atiende un asesor 🙂"
 
 @app.route('/', methods=['GET'])
 def inicio():
-    return "¡Servidor de WhatsApp e IA activo correctamente! 🚀", 200
+    return f"¡Servidor de {CHAT_PLATFORM.upper()} e IA activo correctamente! 🚀", 200
 
 
 @app.route('/health', methods=['GET'])
@@ -211,6 +224,9 @@ def health_check():
 @app.route('/webhook', methods=['GET'])
 def verificar_webhook():
     """Verifica el webhook con Meta (WhatsApp)."""
+    if CHAT_PLATFORM != "meta":
+        return jsonify({"error": "GET webhook solo para Meta"}), 400
+    
     mode = request.args.get('hub.mode')
     token = request.args.get('hub.verify_token')
     challenge = request.args.get('hub.challenge')
@@ -227,141 +243,191 @@ def verificar_webhook():
 
 @app.route('/webhook', methods=['POST'])
 def recibir_mensaje():
-    """Recibe y procesa mensajes de WhatsApp."""
+    """Recibe y procesa mensajes desde Meta o SleekFlow."""
     data = request.get_json()
 
     try:
-        entries = data.get('entry', [])
-        for entry in entries:
-            changes = entry.get('changes', [])
-            for change in changes:
-                value = change.get('value', {})
-
-                if change.get('field') != 'messages' or value.get('messaging_product') != 'whatsapp':
-                    continue
-
-                contacts = value.get('contacts', [])
-                nombre_usuario = "Usuario"
-                if contacts:
-                    nombre_usuario = contacts[0].get('profile', {}).get('name', 'Usuario')
-
-                metadata = value.get('metadata', {})
-                phone_number_id = metadata.get('phone_number_id')
-
-                messages = value.get('messages', [])
-                for message in messages:
-                    numero_usuario = message.get('from')
-
-                    texto_usuario = None
-                    if message.get('type') == 'text':
-                        texto_usuario = message.get('text', {}).get('body')
-
-                    referral = message.get('referral')
-                    ad_context = ""
-                    if referral:
-                        headline = referral.get('headline', '')
-                        body = referral.get('body', '')
-                        source_id = referral.get('source_id', '')
-                        source_type = referral.get('source_type', '')
-                        ad_context = f"\n[El usuario hizo clic en el anuncio de Facebook: '{headline}' - '{body}' (ID: {source_id})]"
-                        if not texto_usuario:
-                            texto_usuario = f"Hola, me interesa el anuncio: {headline}"
-
-                    if texto_usuario:
-                        print(f"📩 {nombre_usuario} ({numero_usuario}) dijo: {texto_usuario}", flush=True)
-
-                        instrucciones_sistema = (
-                            "Eres un asistente de servicio al cliente automatizado y amable.\n"
-                            "Usa ÚNICAMENTE el siguiente contexto para responder la pregunta del usuario.\n"
-                            "REGLA CRÍTICA: Si la respuesta no se encuentra explícitamente en el contexto, "
-                            "sigue las reglas de escalamiento definidas en el contexto (mensaje de escalación + "
-                            "llamada a la función notificar_traspaso). No inventes ni asumas información.\n\n"
-                            f"Contexto:\n{contexto_privado}"
-                        )
-
-                        if ad_context:
-                            instrucciones_sistema += (
-                                f"\n\nContexto de origen del anuncio:\n{ad_context}\n"
-                                "IMPORTANTE: Saluda amigablemente haciendo alusión al anuncio de forma natural "
-                                "y prioriza la información del contexto privado relacionada con el tema del anuncio."
-                            )
-
-                        # --- Historial: últimos N turnos de este número + mensaje actual ---
-                        historial_previo = obtener_historial(numero_usuario)
-                        entrada_modelo = historial_previo + [{"role": "user", "content": texto_usuario}]
-
-                        if not client:
-                            print(f"❌ Cliente OpenAI no disponible. OPENAI_API_KEY no configurada.", flush=True)
-                            enviar_whatsapp(numero_usuario, MENSAJE_RESPALDO_GENERICO, phone_number_id)
-                            continue
-
-                        response = client.responses.create(
-                            model="gpt-4o-mini",
-                            instructions=instrucciones_sistema,
-                            input=entrada_modelo,
-                            temperature=0,
-                            max_output_tokens=2048,
-                            store=True,
-                            tools=tools_traspaso,
-                        )
-
-                        respuesta_final = response.output_text or ""
-
-                        tipo_traspaso_detectado = None
-                        for item in response.output:
-                            if getattr(item, "type", None) == "function_call" and item.name == "notificar_traspaso":
-                                try:
-                                    datos = json.loads(item.arguments)
-                                except json.JSONDecodeError:
-                                    datos = {}
-
-                                tipo_traspaso_detectado = datos.get("tipo")
-                                etiqueta = {
-                                    "listo_para_inscribir": "🔥 LISTO PARA INSCRIBIR",
-                                    "duda_sin_resolver": "❓ DUDA SIN RESOLVER",
-                                    "tramite_administrativo": "🗂 TRÁMITE ADMINISTRATIVO",
-                                }.get(tipo_traspaso_detectado, tipo_traspaso_detectado or "TRASPASO")
-
-                                aviso = (
-                                    f"{etiqueta}\n"
-                                    f"Programa: {datos.get('programa', 'N/A')}\n"
-                                    f"Cliente: {nombre_usuario} ({numero_usuario})\n"
-                                    f"Nota: {datos.get('resumen', 'Sin detalle')}"
-                                )
-                                enviar_whatsapp(NUMERO_ASESOR, aviso, phone_number_id)
-
-                        if not respuesta_final:
-                            respuesta_final = MENSAJES_RESPALDO.get(
-                                tipo_traspaso_detectado, MENSAJE_RESPALDO_GENERICO
-                            )
-                        elif tipo_traspaso_detectado == "listo_para_inscribir":
-                            # Asegurar que se le envíe la información de contacto para la inscripción
-                            instruccion_inscripcion = (
-                                "Para continuar con tu inscripción, comunícate al número 6144150015 con el mensaje "
-                                "\"estoy listo para la inscripcion\" o haz clic en este enlace: "
-                                "https://wa.me/526144150015?text=estoy%20listo%20para%20la%20inscripcion"
-                            )
-                            if "6144150015" not in respuesta_final and "614 415 0015" not in respuesta_final:
-                                respuesta_final = respuesta_final.strip() + "\n\n" + instruccion_inscripcion
-
-                        enviar_whatsapp(numero_usuario, respuesta_final, phone_number_id)
-                        print(f"🤖 Chatbot respondió: {respuesta_final}", flush=True)
-
-                        # --- Guardar el turno en el historial (usuario + respuesta del bot) ---
-                        guardar_mensaje(numero_usuario, "user", texto_usuario)
-                        guardar_mensaje(numero_usuario, "assistant", respuesta_final)
-                        limpiar_historial_antiguo(numero_usuario)
+        if CHAT_PLATFORM == "meta":
+            procesar_meta(data)
+        elif CHAT_PLATFORM == "sleekflow":
+            procesar_sleekflow(data)
+        else:
+            print(f"❌ Plataforma desconocida: {CHAT_PLATFORM}", flush=True)
 
     except Exception as e:
-        print(f"❌ Error interno procesando el flujo de Meta: {e}", flush=True)
+        print(f"❌ Error interno procesando mensaje: {e}", flush=True)
         import traceback
         traceback.print_exc()
 
     return jsonify({"status": "success"}), 200
 
 
-def enviar_whatsapp(number, text, phone_number_id=None):
-    """Envía un mensaje de texto por WhatsApp."""
+def procesar_meta(data):
+    """Procesa mensajes desde Meta (WhatsApp)."""
+    entries = data.get('entry', [])
+    for entry in entries:
+        changes = entry.get('changes', [])
+        for change in changes:
+            value = change.get('value', {})
+
+            if change.get('field') != 'messages' or value.get('messaging_product') != 'whatsapp':
+                continue
+
+            contacts = value.get('contacts', [])
+            nombre_usuario = "Usuario"
+            if contacts:
+                nombre_usuario = contacts[0].get('profile', {}).get('name', 'Usuario')
+
+            metadata = value.get('metadata', {})
+            phone_number_id = metadata.get('phone_number_id')
+
+            messages = value.get('messages', [])
+            for message in messages:
+                numero_usuario = message.get('from')
+
+                texto_usuario = None
+                if message.get('type') == 'text':
+                    texto_usuario = message.get('text', {}).get('body')
+
+                referral = message.get('referral')
+                ad_context = ""
+                if referral:
+                    headline = referral.get('headline', '')
+                    body = referral.get('body', '')
+                    source_id = referral.get('source_id', '')
+                    source_type = referral.get('source_type', '')
+                    ad_context = f"\n[El usuario hizo clic en el anuncio de Facebook: '{headline}' - '{body}' (ID: {source_id})]"
+                    if not texto_usuario:
+                        texto_usuario = f"Hola, me interesa el anuncio: {headline}"
+
+                if texto_usuario:
+                    procesar_chatbot(
+                        texto_usuario, 
+                        numero_usuario, 
+                        nombre_usuario, 
+                        ad_context, 
+                        phone_number_id
+                    )
+
+
+def procesar_sleekflow(data):
+    """Procesa mensajes desde SleekFlow."""
+    payload = data.get('payload', {})
+    message_type = payload.get('type')
+    
+    if message_type == 'text':
+        texto_usuario = payload.get('text', {}).get('body')
+        customer_id = data.get('customerId')
+        phone_number = payload.get('from')
+        nombre_usuario = data.get('customerName', 'Usuario')
+        
+        if texto_usuario:
+            procesar_chatbot(
+                texto_usuario,
+                phone_number,
+                nombre_usuario,
+                "",
+                customer_id
+            )
+
+
+def procesar_chatbot(texto_usuario, numero_usuario, nombre_usuario, ad_context, reference_id):
+    """Procesa la lógica del chatbot (común para Meta y SleekFlow)."""
+    print(f"📩 {nombre_usuario} ({numero_usuario}) dijo: {texto_usuario}", flush=True)
+
+    instrucciones_sistema = (
+        "Eres un asistente de servicio al cliente automatizado y amable.\n"
+        "Usa ÚNICAMENTE el siguiente contexto para responder la pregunta del usuario.\n"
+        "REGLA CRÍTICA: Si la respuesta no se encuentra explícitamente en el contexto, "
+        "sigue las reglas de escalamiento definidas en el contexto (mensaje de escalación + "
+        "llamada a la función notificar_traspaso). No inventes ni asumas información.\n\n"
+        f"Contexto:\n{contexto_privado}"
+    )
+
+    if ad_context:
+        instrucciones_sistema += (
+            f"\n\nContexto de origen del anuncio:\n{ad_context}\n"
+            "IMPORTANTE: Saluda amigablemente haciendo alusión al anuncio de forma natural "
+            "y prioriza la información del contexto privado relacionada con el tema del anuncio."
+        )
+
+    # --- Historial: últimos N turnos de este número + mensaje actual ---
+    historial_previo = obtener_historial(numero_usuario)
+    entrada_modelo = historial_previo + [{"role": "user", "content": texto_usuario}]
+
+    if not client:
+        print(f"❌ Cliente OpenAI no disponible. OPENAI_API_KEY no configurada.", flush=True)
+        enviar_respuesta(numero_usuario, MENSAJE_RESPALDO_GENERICO, reference_id)
+        return
+
+    response = client.responses.create(
+        model="gpt-4o-mini",
+        instructions=instrucciones_sistema,
+        input=entrada_modelo,
+        temperature=0,
+        max_output_tokens=2048,
+        store=True,
+        tools=tools_traspaso,
+    )
+
+    respuesta_final = response.output_text or ""
+
+    tipo_traspaso_detectado = None
+    for item in response.output:
+        if getattr(item, "type", None) == "function_call" and item.name == "notificar_traspaso":
+            try:
+                datos = json.loads(item.arguments)
+            except json.JSONDecodeError:
+                datos = {}
+
+            tipo_traspaso_detectado = datos.get("tipo")
+            etiqueta = {
+                "listo_para_inscribir": "🔥 LISTO PARA INSCRIBIR",
+                "duda_sin_resolver": "❓ DUDA SIN RESOLVER",
+                "tramite_administrativo": "🗂 TRÁMITE ADMINISTRATIVO",
+            }.get(tipo_traspaso_detectado, tipo_traspaso_detectado or "TRASPASO")
+
+            aviso = (
+                f"{etiqueta}\n"
+                f"Programa: {datos.get('programa', 'N/A')}\n"
+                f"Cliente: {nombre_usuario} ({numero_usuario})\n"
+                f"Nota: {datos.get('resumen', 'Sin detalle')}"
+            )
+            enviar_respuesta(NUMERO_ASESOR, aviso, reference_id)
+
+    if not respuesta_final:
+        respuesta_final = MENSAJES_RESPALDO.get(
+            tipo_traspaso_detectado, MENSAJE_RESPALDO_GENERICO
+        )
+    elif tipo_traspaso_detectado == "listo_para_inscribir":
+        # Asegurar que se le envíe la información de contacto para la inscripción
+        instruccion_inscripcion = (
+            "Para continuar con tu inscripción, comunícate al número 6144150015 con el mensaje "
+            "\"estoy listo para la inscripcion\" o haz clic en este enlace: "
+            "https://wa.me/526144150015?text=estoy%20listo%20para%20la%20inscripcion"
+        )
+        if "6144150015" not in respuesta_final and "614 415 0015" not in respuesta_final:
+            respuesta_final = respuesta_final.strip() + "\n\n" + instruccion_inscripcion
+
+    enviar_respuesta(numero_usuario, respuesta_final, reference_id)
+    print(f"🤖 Chatbot respondió: {respuesta_final}", flush=True)
+
+    # --- Guardar el turno en el historial (usuario + respuesta del bot) ---
+    guardar_mensaje(numero_usuario, "user", texto_usuario)
+    guardar_mensaje(numero_usuario, "assistant", respuesta_final)
+    limpiar_historial_antiguo(numero_usuario)
+
+
+def enviar_respuesta(number, text, reference_id=None):
+    """Envía un mensaje según la plataforma configurada."""
+    if CHAT_PLATFORM == "meta":
+        enviar_whatsapp_meta(number, text, reference_id)
+    elif CHAT_PLATFORM == "sleekflow":
+        enviar_respuesta_sleekflow(reference_id, number, text)
+
+
+def enviar_whatsapp_meta(number, text, phone_number_id=None):
+    """Envía un mensaje de texto por WhatsApp a través de Meta."""
     if not phone_number_id:
         phone_number_id = PHONE_NUMBER_ID
     
@@ -385,9 +451,40 @@ def enviar_whatsapp(number, text, phone_number_id=None):
         if res.status_code != 200:
             print(f"⚠️ Error enviando mensaje a {number}: {res.status_code} - {res.text}", flush=True)
         else:
-            print(f"✅ Mensaje enviado a {number}", flush=True)
+            print(f"✅ Mensaje enviado a {number} (Meta)", flush=True)
     except Exception as e:
-        print(f"❌ Error en enviar_whatsapp: {e}", flush=True)
+        print(f"❌ Error en enviar_whatsapp_meta: {e}", flush=True)
+
+
+def enviar_respuesta_sleekflow(customer_id, phone_number, texto_respuesta):
+    """Envía un mensaje de texto por WhatsApp a través de SleekFlow."""
+    if not SLEEKFLOW_API_KEY:
+        print(f"❌ Error: SLEEKFLOW_API_KEY no configurada", flush=True)
+        return
+    
+    headers = {
+        "Authorization": f"Bearer {SLEEKFLOW_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    # Cuerpo de la petición según la API de SleekFlow
+    body = {
+        "customerId": customer_id,
+        "recipient": phone_number,
+        "type": "text",
+        "text": {
+            "body": texto_respuesta
+        }
+    }
+    
+    try:
+        response = requests.post(SLEEKFLOW_URL, json=body, headers=headers)
+        if response.status_code != 200:
+            print(f"⚠️ Error enviando mensaje a {phone_number} (SleekFlow): {response.status_code} - {response.text}", flush=True)
+        else:
+            print(f"✅ Mensaje enviado a {phone_number} (SleekFlow)", flush=True)
+        return response.status_code
+    except Exception as e:
+        print(f"❌ Error en enviar_respuesta_sleekflow: {e}", flush=True)
 
 
 if __name__ == '__main__':
